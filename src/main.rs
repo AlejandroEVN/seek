@@ -1,11 +1,28 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::{
-    fs::{self, DirEntry},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
-    thread,
-    time::Instant,
+    fs::{self},
+    io::{self, Write},
+    os::unix::fs::FileTypeExt,
+    path::PathBuf,
 };
+
+#[derive(Clone, Debug, ValueEnum)]
+enum FileType {
+    #[value(name = "f", help = "(file)")]
+    File,
+    #[value(name = "d", help = "(directory)")]
+    Dir,
+    #[value(name = "l", help = "(symlink)")]
+    Symlink,
+    #[value(name = "p", help = "(fifo)")]
+    Fifo,
+    #[value(name = "s", help = "(socket)")]
+    Socket,
+    #[value(name = "c", help = "(char-device)")]
+    CharDevice,
+    #[value(name = "b", help = "(block-device)")]
+    BlockDevice,
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -13,129 +30,93 @@ struct Args {
     #[arg(short, long, default_value = ".")]
     path: String,
 
-    #[arg(short, long)]
-    threads: Option<usize>,
+    #[arg(short, long, value_enum)]
+    dir_type: Option<FileType>,
 }
-
-const DEFAULT_THREADS: usize = 1;
 
 fn main() {
     let args = Args::parse();
 
-    measure("naive", || naive_implementation(&args));
-    measure("pro", || pro_implementation(&args));
+    process(&args);
 
     std::process::exit(0);
 }
 
-fn measure<T, F: FnOnce() -> T>(label: &str, f: F) {
-    let start = Instant::now();
-    f();
-    println!("{} took: {:?}", label, start.elapsed());
-}
-
-fn naive_implementation(args: &Args) {
-    let files = process(args.path.clone());
-
-    println!("{:?}", files.len());
-}
-
-fn process<T: AsRef<Path>>(path: T) -> Vec<DirEntry> {
-    let mut files = Vec::new();
-    let mut to_visit = vec![path.as_ref().to_path_buf()];
+fn process(args: &Args) {
+    let stdout = io::stdout();
+    let mut handle = io::BufWriter::new(stdout);
+    let mut to_visit = vec![PathBuf::from(&args.path)];
 
     while let Some(path) = to_visit.pop() {
-        match fs::read_dir(path) {
-            Ok(mut dirs) => {
-                while let Some(Ok(dir_entry)) = dirs.next() {
-                    if dir_entry.metadata().unwrap().is_dir() {
-                        to_visit.push(dir_entry.path());
-                    } else {
-                        files.push(dir_entry);
+        let dirs = match fs::read_dir(path) {
+            Ok(dirs) => dirs,
+            Err(err) => {
+                eprintln!("{err}");
+                continue;
+            }
+        };
+
+        for entry in dirs.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                to_visit.push(entry.path());
+            }
+
+            let filter_by_type = match &args.dir_type {
+                Some(fbt) => fbt,
+                None => {
+                    writeln!(handle, "{}", entry.path().to_str().unwrap()).unwrap();
+                    continue;
+                }
+            };
+
+            let mut matched = None;
+
+            match filter_by_type {
+                FileType::File => {
+                    if file_type.is_file() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::Dir => {
+                    if file_type.is_dir() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::Symlink => {
+                    if file_type.is_symlink() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::Fifo => {
+                    if file_type.is_fifo() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::Socket => {
+                    if file_type.is_socket() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::CharDevice => {
+                    if file_type.is_char_device() {
+                        matched = Some(entry.path());
+                    }
+                }
+                FileType::BlockDevice => {
+                    if file_type.is_block_device() {
+                        matched = Some(entry.path());
                     }
                 }
             }
-            Err(_) => {
-                //eprintln!("error: no such path: {err}");
-                continue;
+
+            if let Some(matched) = matched {
+                writeln!(handle, "{:?}", matched).unwrap();
             }
         }
     }
-
-    files
-}
-
-fn pro_implementation(args: &Args) {
-    let thread_count = args.threads.unwrap_or_else(|| {
-        thread::available_parallelism()
-            .map(|t| t.get())
-            .unwrap_or(DEFAULT_THREADS)
-    });
-
-    let (tx, rx) = mpsc::channel::<PathBuf>();
-    let (results_tx, results_rx) = mpsc::channel::<Vec<DirEntry>>();
-    let shared_rx = Arc::new(Mutex::new(rx));
-
-    let mut threads_handlers = vec![];
-
-    tx.send(PathBuf::from(&args.path)).unwrap();
-
-    for _ in 0..thread_count {
-        let rx_clone = Arc::clone(&shared_rx);
-        let tx_clone = tx.clone();
-        let results_tx_clone = results_tx.clone();
-
-        let handle = thread::spawn(move || {
-            loop {
-                let lock = rx_clone.lock().unwrap();
-
-                match lock.recv() {
-                    Ok(dir_entry) => {
-                        drop(lock);
-
-                        let mut files = Vec::new();
-
-                        if dir_entry.metadata().unwrap().is_dir() {
-                            match fs::read_dir(dir_entry) {
-                                Ok(mut dirs) => {
-                                    while let Some(Ok(dir_entry)) = dirs.next() {
-                                        if dir_entry.metadata().unwrap().is_dir() {
-                                            tx_clone.send(dir_entry.path()).unwrap();
-                                            continue;
-                                        } else {
-                                            files.push(dir_entry);
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    continue;
-                                }
-                            }
-                        }
-
-                        results_tx_clone.send(files).unwrap();
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        threads_handlers.push(handle);
-    }
-
-    drop(tx);
-    drop(results_tx);
-
-    for handle in threads_handlers {
-        handle.join().unwrap();
-    }
-
-    let mut total = 0;
-    for rx in results_rx {
-        total += rx.len();
-    }
-
-    println!("{total}");
 }
