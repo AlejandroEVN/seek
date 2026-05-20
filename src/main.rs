@@ -1,5 +1,4 @@
 use clap::{Parser, ValueEnum};
-use core::panic;
 use std::{
     fs::{self, FileType},
     io::{self, Write, stdout},
