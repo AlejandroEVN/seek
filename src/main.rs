@@ -3,10 +3,10 @@ mod args;
 use crate::args::{Args, ArgsFileType};
 
 use std::{
-    fs::{self},
+    fs::{self, FileType},
     io::{self, Write, stdout},
     os::unix::fs::FileTypeExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 fn main() {
@@ -21,8 +21,8 @@ fn process<W: Write>(args: &Args, writer: &mut W) {
     let mut handle = io::BufWriter::new(writer);
     let root_path = PathBuf::from(&args.path);
 
-    if root_path.exists() {
-        if should_print_entry_path(&root_path, &args) {
+    if let Ok(metadata) = root_path.symlink_metadata() {
+        if should_print_entry_path(&metadata.file_type(), &args) {
             writeln!(handle, "{}", &root_path.to_str().unwrap().to_string()).unwrap();
         }
     } else {
@@ -69,7 +69,7 @@ fn process<W: Write>(args: &Args, writer: &mut W) {
                 if let Some(name) = entry.file_name().to_str() {
                     if prune_vec
                         .iter()
-                        .any(|p| p.prune_name.contains(name) && *p == file_type)
+                        .any(|p| p.prune_name == name && *p == file_type)
                     {
                         continue;
                     }
@@ -80,9 +80,7 @@ fn process<W: Write>(args: &Args, writer: &mut W) {
                 to_visit.push(entry.path());
             }
 
-            let should_print = should_print_entry_path(&entry.path(), &args);
-
-            if !should_print {
+            if !should_print_entry_path(&file_type, &args) {
                 continue;
             }
 
@@ -93,13 +91,7 @@ fn process<W: Write>(args: &Args, writer: &mut W) {
     handle.flush().unwrap();
 }
 
-fn should_print_entry_path(path: &Path, args: &Args) -> bool {
-    let Ok(metadata) = path.symlink_metadata() else {
-        return false;
-    };
-
-    let file_type = metadata.file_type();
-
+fn should_print_entry_path(file_type: &FileType, args: &Args) -> bool {
     let should_print = match &args.dir_type {
         Some(fbt) => match fbt {
             ArgsFileType::File => file_type.is_file(),
